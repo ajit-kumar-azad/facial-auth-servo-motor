@@ -1,3 +1,8 @@
-# facial-auth-servo-motor
+source venv/bin/activate
+uvicorn main:app --reload
+streamlit run streamlit_app.py
 
-Project that validates a user face using a camera against the user (and their faces) stored in the database and turns the servo motor to open/close door.
+
+# To cleand the user table and media folder
+sudo -u postgres psql -d face_db -c "TRUNCATE TABLE users RESTART IDENTITY CASCADE;"
+rm -f ~/apps/face_api/media/users/*.jpg
