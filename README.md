@@ -1,3 +1,7 @@
+# create venv
+``python -m venv venv``
+
+# run API server and the streamlit app
 ```
 source venv/bin/activate
 uvicorn main:app --reload
