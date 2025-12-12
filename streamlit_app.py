@@ -274,7 +274,7 @@ with tab2:
     with col_right:
         st.markdown("#### Image Preview")
         if identify_image:
-            st.image(identify_image, caption="Image to identify", use_column_width=True)
+            st.image(identify_image, caption="Image to identify", use_container_width=True)
 
 
 # ===========================================
@@ -373,7 +373,7 @@ with tab3:
                     FRAME_PLACEHOLDER.image(
                         frame_with_boxes[:, :, ::-1],
                         channels="RGB",
-                        use_column_width=True,
+                        use_container_width=True,
                     )
 
                     # Small delay
