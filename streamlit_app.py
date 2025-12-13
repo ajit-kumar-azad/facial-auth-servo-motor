@@ -20,6 +20,55 @@ API_BASE_URL = "http://127.0.0.1:8000"  # FastAPI server
 # HELPER FUNCTIONS
 # ==========================
 
+import base64
+import serial
+import serial.tools.list_ports
+import time
+
+def list_serial_ports():
+    return [p.device for p in serial.tools.list_ports.comports()]
+
+def connect_serial(port: str, baud: int = 9600, timeout: float = 1.0):
+    try:
+        ser = serial.Serial(port, baudrate=baud, timeout=timeout)
+        # tiny settle
+        time.sleep(0.3)
+        # clear any boot text
+        ser.reset_input_buffer()
+        ser.reset_output_buffer()
+        return ser
+    except Exception as e:
+        st.error(f"Failed to open serial {port}: {e}")
+        return None
+
+def send_cmd(ser: serial.Serial | None, cmd: str, expect_ok: bool = False, show_feedback: bool = True):
+    if ser is None or not ser.is_open:
+        if show_feedback:
+            st.error("Serial not connected.")
+        return False, ""
+    try:
+        ser.write((cmd.strip() + "\n").encode("utf-8"))
+        ser.flush()
+        if expect_ok:
+            line = ser.readline().decode(errors="ignore").strip()
+            if show_feedback:
+                st.caption(f"Arduino: {line}")
+            return ("OK" in line or "READY" in line), line
+        return True, ""
+    except Exception as e:
+        if show_feedback:
+            st.error(f"Serial write failed: {e}")
+        return False, ""
+
+def play_audio_autoplay(mp3_bytes: bytes):
+    b64 = base64.b64encode(mp3_bytes).decode("ascii")
+    audio_html = f"""
+    <audio autoplay style="display:none">
+        <source src="data:audio/mp3;base64,{b64}" type="audio/mpeg">
+    </audio>
+    """
+    st.markdown(audio_html, unsafe_allow_html=True)
+
 def api_create_user(name: str, image_bytes: bytes):
     files = {
         "image": ("image.jpg", image_bytes, "image/jpeg"),
@@ -147,6 +196,37 @@ try:
 except Exception as e:
     st.sidebar.error("❌ Cannot reach API")
     st.sidebar.code(str(e))
+
+st.sidebar.markdown("### Arduino")
+available_ports = list_serial_ports()
+port = st.sidebar.selectbox("Serial port", options=[""] + available_ports, index=0, help="e.g., /dev/ttyACM0")
+baud = st.sidebar.number_input("Baud", value=9600, step=1)
+
+if "arduino" not in st.session_state:
+    st.session_state["arduino"] = None
+
+colA, colB = st.sidebar.columns(2)
+if colA.button("Connect"):
+    if not port:
+        st.sidebar.error("Select a serial port.")
+    else:
+        ser = connect_serial(port, baud)
+        if ser:
+            st.sidebar.success("Connected")
+            st.session_state["arduino"] = ser
+if colB.button("Disconnect"):
+    ser = st.session_state.get("arduino")
+    if ser and ser.is_open:
+        ser.close()
+    st.session_state["arduino"] = None
+    st.sidebar.info("Disconnected")
+
+# Quick test buttons
+t1, t2 = st.sidebar.columns(2)
+if t1.button("Test OPEN"):
+    send_cmd(st.session_state.get("arduino"), "SERVO 180", expect_ok=True)
+if t2.button("Test CLOSE"):
+    send_cmd(st.session_state.get("arduino"), "SERVO 0", expect_ok=True)
 
 
 tab1, tab2, tab3 = st.tabs(["👤 User Management", "🖼 Identify from Photo", "📷 Live Camera Recognition"])
@@ -278,22 +358,20 @@ with tab2:
 
 
 # ===========================================
-# TAB 3: LIVE CAMERA RECOGNITION
+# TAB 3: LIVE CAMERA RECOGNITION (Speak & Stop)
 # ===========================================
 
+from gtts import gTTS
+import io
+
 with tab3:
-    st.subheader("Live Camera Recognition")
-
+    st.subheader("Live Camera Recognition (with Servo Trigger)")
     st.markdown(
-        "This uses your webcam to detect faces and match them against known users. "
-        "Green box = known user, Red box = UNKNOWN."
+        "When a **known** face is detected, send **OPEN**, wait 2s, then **CLOSE** to the Arduino servo. "
+        "Detection continues afterwards."
     )
 
-    st.info(
-        "For this to work efficiently, add a small endpoint `/users_full` that returns `id`, `name`, and `embedding`."
-    )
-
-    if st.button("Load known faces from API"):
+    if st.button("Load known faces from API", key="btn_load_known"):
         with st.spinner("Loading known embeddings..."):
             encodings, names, ids = load_known_faces_from_api()
         if encodings:
@@ -307,11 +385,14 @@ with tab3:
     known_encodings = st.session_state.get("known_encodings", [])
     known_names = st.session_state.get("known_names", [])
 
-    start_cam = st.checkbox("Start Camera", value=False, key="start_cam")
+    # state vars
+    st.session_state.setdefault("start_cam_servo", False)
+    st.session_state.setdefault("servo_cooldown_until", 0.0)  # epoch seconds to prevent rapid retriggers
+    start_cam_servo = st.checkbox("Start Camera", value=st.session_state["start_cam_servo"], key="start_cam_servo")
 
     FRAME_PLACEHOLDER = st.empty()
 
-    if start_cam:
+    if start_cam_servo:
         if not known_encodings:
             st.warning("No known faces loaded. Click **Load known faces from API** first.")
         else:
@@ -319,7 +400,7 @@ with tab3:
             if not cap.isOpened():
                 st.error("Cannot open webcam. Check your camera permissions.")
             else:
-                st.info("Uncheck **Start Camera** or stop the app to end the stream.")
+                st.info("Streaming… known face will trigger the servo (open→2s→close).")
                 FACE_MATCH_THRESHOLD = 0.6
 
                 while True:
@@ -328,55 +409,73 @@ with tab3:
                         st.error("Failed to grab frame from camera.")
                         break
 
-                    # Ensure frame is uint8 RGB and contiguous
+                    # RGB contiguous frame
                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                     rgb_frame = np.ascontiguousarray(rgb_frame, dtype=np.uint8)
 
-                    # Detect faces
                     face_locations = face_recognition.face_locations(rgb_frame)
-
-                    # Compute encodings, with a safe fallback if dlib complains
                     try:
                         face_encodings = face_recognition.face_encodings(rgb_frame, face_locations)
                     except TypeError:
-                        # Fallback: let face_recognition handle detection internally
                         face_encodings = face_recognition.face_encodings(rgb_frame)
 
-                    names_for_frame = []
-                    colors_for_frame = []
+                    names_for_frame, colors_for_frame = [], []
+                    authorized_detected = False
+                    authorized_name = None
 
                     for face_encoding in face_encodings:
-                        distances = np.linalg.norm(
-                            np.array(known_encodings) - face_encoding, axis=1
-                        )
+                        distances = np.linalg.norm(np.array(known_encodings) - face_encoding, axis=1)
                         if len(distances) == 0:
-                            names_for_frame.append("UNKNOWN")
-                            colors_for_frame.append((0, 0, 255))  # red
-                            continue
-
-                        best_idx = int(np.argmin(distances))
-                        best_dist = distances[best_idx]
-
-                        if best_dist <= FACE_MATCH_THRESHOLD:
-                            names_for_frame.append(known_names[best_idx])
-                            colors_for_frame.append((0, 255, 0))  # green
+                            cur_name, cur_color = "UNKNOWN", (0, 0, 255)
                         else:
-                            names_for_frame.append("UNKNOWN")
-                            colors_for_frame.append((0, 0, 255))  # red
+                            best_idx = int(np.argmin(distances))
+                            best_dist = float(distances[best_idx])
+                            if best_dist <= FACE_MATCH_THRESHOLD:
+                                cur_name, cur_color = known_names[best_idx], (0, 255, 0)
+                                authorized_detected = True
+                                authorized_name = cur_name
+                            else:
+                                cur_name, cur_color = "UNKNOWN", (0, 0, 255)
 
-                    # Draw boxes + labels
-                    frame_with_boxes = draw_labeled_boxes(
-                        frame, face_locations, names_for_frame, colors_for_frame
-                    )
+                        names_for_frame.append(cur_name)
+                        colors_for_frame.append(cur_color)
 
-                    # Show frame (convert BGR->RGB)
-                    FRAME_PLACEHOLDER.image(
-                        frame_with_boxes[:, :, ::-1],
-                        channels="RGB",
-                        use_container_width=True,
-                    )
+                    frame_with_boxes = draw_labeled_boxes(frame, face_locations, names_for_frame, colors_for_frame)
+                    FRAME_PLACEHOLDER.image(frame_with_boxes[:, :, ::-1], channels="RGB", use_container_width=True)
 
-                    # Small delay
+                    # if we have any detection: speak and end
+                    if authorized_name is not None:
+                        detected_name_once = authorized_name
+                        # TTS -> autoplay
+                        try:
+                            buf = io.BytesIO()
+                            text_to_say = detected_name_once if detected_name_once != "UNKNOWN" else "Unknown"
+                            gTTS(text=text_to_say, lang="en").write_to_fp(buf)
+                            buf.seek(0)
+                            play_audio_autoplay(buf.read())
+                        except Exception as tts_err:
+                            st.warning(f"Could not synthesize audio: {tts_err}")
+
+                    # Trigger servo if authorized face and cooldown passed
+                    now = time.time()
+                    if authorized_detected and now >= st.session_state["servo_cooldown_until"]:
+                        ser = st.session_state.get("arduino")
+                        if ser is None or not ser.is_open:
+                            st.warning("Authorized face detected but Arduino is not connected.")
+                        else:
+                            st.success(f"Authorized: {authorized_name or 'User'} → OPEN door")
+                            ok, _ = send_cmd(ser, "SERVO 180", expect_ok=True, show_feedback=False)
+                            if not ok:
+                                st.error("Failed to send OPEN")
+                            # door stays open for 2 seconds
+                            time.sleep(2.0)
+                            ok, _ = send_cmd(ser, "SERVO 0", expect_ok=True, show_feedback=False)
+                            if not ok:
+                                st.error("Failed to send CLOSE")
+                            # small cooldown to avoid re-triggering every frame
+                            st.session_state["servo_cooldown_until"] = time.time() + 3.0
+
+                    # keep the loop running smoothly
                     time.sleep(0.03)
 
                 cap.release()
